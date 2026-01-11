@@ -189,52 +189,52 @@ class TradingAgent
       if response[:tool_calls].nil? || response[:tool_calls].empty?
         @logger.info("AGENT: Terminal response received (no tool calls)")
         @logger.info("AGENT: Final content: #{response[:content][0..100]}...")
-        
+
         # STRICT CHECK: If no tools were called yet, force tool usage
         if tools_called_count == 0
           @logger.warn("AGENT: WARNING - No tools called yet but LLM returned response!")
           @logger.warn("AGENT: This is FORBIDDEN - forcing tool usage")
-          
+
           conversation << {
             role: "user",
             content: "STOP. You MUST call tools to get real data. You cannot provide analysis without calling find_instrument first. Call find_instrument(symbol='NIFTY', segment='IDX_I') immediately."
           }
           next  # Retry the loop
         end
-        
+
         # Check if LLM is describing actions instead of calling tools
         if describes_tool_usage?(response[:content]) && tools_called_count < 5
           @logger.warn("AGENT: WARNING - LLM is describing tool usage instead of calling tools!")
           @logger.warn("AGENT: Tools called so far: #{tools_called_count}/5 - forcing next tool call")
-          
+
           # Determine which tool should be called next based on tools_called_count
           today = Date.today
           thirty_days_ago = today - 30
-          
+
           next_tool_instructions = {
             1 => "Call get_daily_ohlcv with security_id=13, exchange_segment='IDX_I', from_date='#{thirty_days_ago.strftime('%Y-%m-%d')}', to_date='#{today.strftime('%Y-%m-%d')}'",
             2 => "Call get_intraday_ohlcv with security_id=13, exchange_segment='IDX_I', from_date='#{today.strftime('%Y-%m-%d')}', to_date='#{today.strftime('%Y-%m-%d')}', interval='5'",
             3 => "Call get_option_chain with security_id=13, exchange_segment='IDX_I'",
             4 => "Call get_ltp with security_id=13, exchange_segment='IDX_I'"
           }
-          
+
           instruction = next_tool_instructions[tools_called_count] || "Complete the workflow by calling the remaining tools"
-          
+
           conversation << {
             role: "user",
             content: "You described calling a tool but did not actually call it. You MUST use the tool calling function, not describe it. #{instruction}. Use the tool calling format, not text description."
           }
           next  # Retry the loop
         end
-        
+
         # STRICT CHECK: Must complete all 5 steps before final response
         if tools_called_count < 5
           @logger.warn("AGENT: WARNING - Only #{tools_called_count}/5 tools called. Forcing continuation.")
-          
+
           # Get the last tool result to extract security_id
           last_tool_result = conversation.reverse.find { |msg| msg[:role] == "tool" }
           security_id = "13"  # Default from find_instrument
-          
+
           if last_tool_result && last_tool_result[:content]
             begin
               tool_data = JSON.parse(last_tool_result[:content])
@@ -251,19 +251,19 @@ class TradingAgent
               end
             end
           end
-          
+
           today = Date.today
           thirty_days_ago = today - 30
-          
+
           next_tool_map = {
             1 => { name: "get_daily_ohlcv", args: { security_id: security_id, exchange_segment: "IDX_I", from_date: thirty_days_ago.strftime('%Y-%m-%d'), to_date: today.strftime('%Y-%m-%d') } },
             2 => { name: "get_intraday_ohlcv", args: { security_id: security_id, exchange_segment: "IDX_I", from_date: today.strftime('%Y-%m-%d'), to_date: today.strftime('%Y-%m-%d'), interval: "5" } },
             3 => { name: "get_option_chain", args: { security_id: security_id, exchange_segment: "IDX_I" } },
             4 => { name: "get_ltp", args: { security_id: security_id, exchange_segment: "IDX_I" } }
           }
-          
+
           next_tool = next_tool_map[tools_called_count]
-          
+
           if next_tool
             @logger.info("AGENT: Forcing call to #{next_tool[:name]} (step #{tools_called_count + 1}/5)")
             conversation << {
@@ -278,12 +278,12 @@ class TradingAgent
           end
           next  # Retry the loop
         end
-        
+
         # Validate response for hallucination
         if contains_hallucinated_data?(response[:content])
           @logger.warn("AGENT: WARNING - Response contains hallucinated data (placeholders detected)!")
           @logger.warn("AGENT: Re-requesting with stronger anti-hallucination instruction")
-          
+
           # Add a follow-up message to force tool usage
           conversation << {
             role: "user",
@@ -291,7 +291,7 @@ class TradingAgent
           }
           next  # Retry the loop
         end
-        
+
         @logger.info("AGENT: Response validated - no hallucination detected")
         return response[:content]
       end
@@ -357,7 +357,7 @@ class TradingAgent
       /should call/i,
       /need to call/i
     ]
-    
+
     description_patterns.any? { |pattern| content.match?(pattern) }
   end
 

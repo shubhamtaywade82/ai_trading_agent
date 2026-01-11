@@ -43,13 +43,22 @@ class DhanClient
     # Note: The API may require instrument type, using "INDEX" as default for indices
     instrument_type = exchange_segment.start_with?("IDX_") ? "INDEX" : nil
 
-    result = DhanHQ::Models::HistoricalData.daily(
-      security_id: security_id,
-      exchange_segment: exchange_segment,
-      instrument: instrument_type,
-      from_date: from_date,
-      to_date: to_date
-    )
+    begin
+      result = DhanHQ::Models::HistoricalData.daily(
+        security_id: security_id,
+        exchange_segment: exchange_segment,
+        instrument: instrument_type,
+        from_date: from_date,
+        to_date: to_date
+      )
+    rescue DhanHQ::InputExceptionError => e
+      @logger.warn("DHAN: API error for daily data - #{e.message}")
+      @logger.warn("DHAN: Returning empty array - data may not be available for these dates")
+      return []
+    rescue => e
+      @logger.error("DHAN: Unexpected error getting daily data - #{e.class}: #{e.message}")
+      return []
+    end
 
     # Normalize response format
     if result.is_a?(Array)
@@ -74,14 +83,23 @@ class DhanClient
     # interval: "1", "5", "15", "30", or "60" minutes
     instrument_type = exchange_segment.start_with?("IDX_") ? "INDEX" : nil
 
-    result = DhanHQ::Models::HistoricalData.intraday(
-      security_id: security_id,
-      exchange_segment: exchange_segment,
-      instrument: instrument_type,
-      interval: interval,
-      from_date: from_date,
-      to_date: to_date
-    )
+    begin
+      result = DhanHQ::Models::HistoricalData.intraday(
+        security_id: security_id,
+        exchange_segment: exchange_segment,
+        instrument: instrument_type,
+        interval: interval,
+        from_date: from_date,
+        to_date: to_date
+      )
+    rescue DhanHQ::InputExceptionError => e
+      @logger.warn("DHAN: API error for intraday data - #{e.message}")
+      @logger.warn("DHAN: Returning empty array - data may not be available for these dates")
+      return []
+    rescue => e
+      @logger.error("DHAN: Unexpected error getting intraday data - #{e.class}: #{e.message}")
+      return []
+    end
 
     # Normalize response format
     if result.is_a?(Array)
@@ -104,30 +122,51 @@ class DhanClient
     @logger.info("DHAN: Getting option chain - Security: #{security_id}, Segment: #{exchange_segment}, Expiry: #{expiry || 'auto'}")
     # Use DhanHQ::Models::OptionChain.fetch
     # Requires underlying_scrip (security_id), underlying_seg (exchange_segment), and expiry
-    if expiry
-      result = DhanHQ::Models::OptionChain.fetch(
-        underlying_scrip: security_id.to_i,
-        underlying_seg: exchange_segment,
-        expiry: expiry
-      )
-    else
-      # If no expiry provided, fetch expiry list first
-      expiries = DhanHQ::Models::OptionChain.fetch_expiry_list(
-        underlying_scrip: security_id.to_i,
-        underlying_seg: exchange_segment
-      )
-
-      # Use nearest expiry if available
-      if expiries.is_a?(Array) && expiries.any?
-        expiry = expiries.first["expiry"] || expiries.first[:expiry]
+    begin
+      if expiry
         result = DhanHQ::Models::OptionChain.fetch(
           underlying_scrip: security_id.to_i,
           underlying_seg: exchange_segment,
           expiry: expiry
         )
       else
-        return { atm: nil, ce: [], pe: [], expiry_dates: [], strikes: [] }
+        # If no expiry provided, fetch expiry list first
+        expiries = DhanHQ::Models::OptionChain.fetch_expiry_list(
+          underlying_scrip: security_id.to_i,
+          underlying_seg: exchange_segment
+        )
+
+        # Use nearest expiry if available
+        if expiries.is_a?(Array) && expiries.any?
+          expiry_value = expiries.first
+          # Handle both hash and string formats
+          expiry = if expiry_value.is_a?(Hash)
+            expiry_value["expiry"] || expiry_value[:expiry] || expiry_value["expiry_date"] || expiry_value[:expiry_date]
+          else
+            expiry_value.to_s
+          end
+
+          if expiry
+            result = DhanHQ::Models::OptionChain.fetch(
+              underlying_scrip: security_id.to_i,
+              underlying_seg: exchange_segment,
+              expiry: expiry
+            )
+          else
+            @logger.warn("DHAN: Could not extract expiry from: #{expiries.first.inspect}")
+            return { atm: nil, ce: [], pe: [], expiry_dates: [], strikes: [] }
+          end
+        else
+          @logger.warn("DHAN: No expiries found for option chain")
+          return { atm: nil, ce: [], pe: [], expiry_dates: [], strikes: [] }
+        end
       end
+    rescue DhanHQ::InputExceptionError => e
+      @logger.warn("DHAN: API error for option chain - #{e.message}")
+      return { atm: nil, ce: [], pe: [], expiry_dates: [], strikes: [] }
+    rescue => e
+      @logger.error("DHAN: Unexpected error getting option chain - #{e.class}: #{e.message}")
+      return { atm: nil, ce: [], pe: [], expiry_dates: [], strikes: [] }
     end
 
     # Normalize response format
@@ -147,10 +186,18 @@ class DhanClient
   def get_ltp(security_id:, exchange_segment:)
     @logger.info("DHAN: Getting LTP - Security: #{security_id}, Segment: #{exchange_segment}")
     # Use DhanHQ::Models::MarketFeed.ltp
-    result = DhanHQ::Models::MarketFeed.ltp(
-      security_id: security_id,
-      exchange_segment: exchange_segment
-    )
+    begin
+      result = DhanHQ::Models::MarketFeed.ltp(
+        security_id: security_id,
+        exchange_segment: exchange_segment
+      )
+    rescue DhanHQ::InputExceptionError => e
+      @logger.warn("DHAN: API error for LTP - #{e.message}")
+      return { ltp: nil, ltt: nil, security_id: security_id, exchange_segment: exchange_segment }
+    rescue => e
+      @logger.error("DHAN: Unexpected error getting LTP - #{e.class}: #{e.message}")
+      return { ltp: nil, ltt: nil, security_id: security_id, exchange_segment: exchange_segment }
+    end
 
     # Normalize response format
     if result.is_a?(Hash)
