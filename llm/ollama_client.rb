@@ -89,7 +89,7 @@ class TradingOllamaClient
       msg = body["message"] || body
 
       @logger.debug("OLLAMA: Message keys: #{msg.keys.inspect if msg.is_a?(Hash)}")
-      @logger.debug("OLLAMA: Full message: #{msg.inspect[0..500]}...")
+      @logger.debug("OLLAMA: Full message: #{msg.inspect}")
 
       # Parse tool calls - Ollama may return them in different formats
       tool_calls = msg["tool_calls"] || msg[:tool_calls] || []

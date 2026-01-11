@@ -40,31 +40,105 @@ class DhanClient
   def get_daily_ohlcv(security_id:, exchange_segment:, from_date:, to_date:)
     @logger.info("DHAN: Getting daily OHLCV - Security: #{security_id}, Segment: #{exchange_segment}, From: #{from_date}, To: #{to_date}")
     # Use DhanHQ::Models::HistoricalData.daily
-    # Note: The API may require instrument type, using "INDEX" as default for indices
+    # Note: The API requires instrument type, using "INDEX" as default for indices
     instrument_type = exchange_segment.start_with?("IDX_") ? "INDEX" : nil
 
     begin
+      # Ensure security_id is a string (API requires string format)
+      security_id_str = security_id.to_s
+
+      @logger.debug("DHAN: Calling HistoricalData.daily with:")
+      @logger.debug("DHAN:   security_id: #{security_id_str.inspect} (type: #{security_id_str.class})")
+      @logger.debug("DHAN:   exchange_segment: #{exchange_segment.inspect}")
+      @logger.debug("DHAN:   instrument: #{instrument_type.inspect}")
+      @logger.debug("DHAN:   from_date: #{from_date.inspect}")
+      @logger.debug("DHAN:   to_date: #{to_date.inspect}")
+
       result = DhanHQ::Models::HistoricalData.daily(
-        security_id: security_id,
+        security_id: security_id_str,
         exchange_segment: exchange_segment,
         instrument: instrument_type,
         from_date: from_date,
         to_date: to_date
       )
+
+      @logger.debug("DHAN: HistoricalData.daily returned: #{result.class}")
+      @logger.debug("DHAN: HistoricalData.daily result structure: #{result.inspect}")
+
+      # Handle different response formats - API might return Hash or Array
+      if result.is_a?(Hash)
+        # First check for hash with OHLCV arrays (most common format from DhanHQ)
+        if (result["open"] || result[:open]) && (result["high"] || result[:high]) && (result["low"] || result[:low]) && (result["close"] || result[:close])
+          # Hash with arrays of OHLCV values - convert to array of objects
+          @logger.info("DHAN: Found hash with OHLCV arrays - converting to array of objects")
+          opens = result["open"] || result[:open] || []
+          highs = result["high"] || result[:high] || []
+          lows = result["low"] || result[:low] || []
+          closes = result["close"] || result[:close] || []
+          volumes = result["volume"] || result[:volume] || []
+          timestamps = result["timestamp"] || result[:timestamp] || []
+
+          # Convert to array of objects
+          result = []
+          max_length = [opens.length, highs.length, lows.length, closes.length].max
+
+          max_length.times do |i|
+            timestamp = timestamps[i]
+            # Convert Unix timestamp to date string if needed
+            date_str = if timestamp
+              begin
+                Time.at(timestamp.to_i).strftime('%Y-%m-%d')
+              rescue
+                nil
+              end
+            end
+
+            result << {
+              date: date_str,
+              timestamp: timestamp,
+              open: opens[i],
+              high: highs[i],
+              low: lows[i],
+              close: closes[i],
+              volume: volumes[i]
+            }
+          end
+
+          @logger.info("DHAN: Converted hash with arrays to array of #{result.length} OHLCV objects")
+        # Check if it's a hash with data array inside
+        elsif result["data"] || result[:data]
+          data_array = result["data"] || result[:data]
+          @logger.debug("DHAN: Found data array in hash, size: #{data_array.is_a?(Array) ? data_array.length : 'N/A'}")
+          result = data_array.is_a?(Array) ? data_array : []
+        elsif result["ohlcv"] || result[:ohlcv]
+          data_array = result["ohlcv"] || result[:ohlcv]
+          @logger.debug("DHAN: Found ohlcv array in hash, size: #{data_array.is_a?(Array) ? data_array.length : 'N/A'}")
+          result = data_array.is_a?(Array) ? data_array : []
+        else
+          # Hash might contain error or other structure - log all keys
+          @logger.warn("DHAN: Daily API returned hash but no recognized structure. Keys: #{result.keys.inspect}")
+          @logger.warn("DHAN: Full hash content: #{result.inspect}")
+          return []
+        end
+      end
+
+      @logger.debug("DHAN: Final processed result type: #{result.class}, size: #{result.is_a?(Array) ? result.length : 'N/A'}")
     rescue DhanHQ::InputExceptionError => e
       @logger.warn("DHAN: API error for daily data - #{e.message}")
+      @logger.warn("DHAN: Full error details: #{e.inspect}")
       @logger.warn("DHAN: Returning empty array - data may not be available for these dates")
       return []
     rescue => e
       @logger.error("DHAN: Unexpected error getting daily data - #{e.class}: #{e.message}")
+      @logger.error("DHAN: Full error backtrace: #{e.backtrace.join("\n")}")
       return []
     end
 
     # Normalize response format
-    if result.is_a?(Array)
+    if result.is_a?(Array) && result.any?
       result.map do |row|
         {
-          date: row["date"] || row[:date],
+          date: row["date"] || row[:date] || row["timestamp"] || row[:timestamp],
           open: row["open"] || row[:open],
           high: row["high"] || row[:high],
           low: row["low"] || row[:low],
@@ -73,6 +147,7 @@ class DhanClient
         }
       end
     else
+      @logger.warn("DHAN: Daily API returned empty or invalid data structure")
       []
     end
   end
@@ -84,28 +159,69 @@ class DhanClient
     instrument_type = exchange_segment.start_with?("IDX_") ? "INDEX" : nil
 
     begin
+      # Ensure security_id is a string (API requires string format)
+      security_id_str = security_id.to_s
+
+      # Ensure interval is a string
+      interval_str = interval.to_s
+
+      @logger.debug("DHAN: Calling HistoricalData.intraday with:")
+      @logger.debug("DHAN:   security_id: #{security_id_str.inspect} (type: #{security_id_str.class})")
+      @logger.debug("DHAN:   exchange_segment: #{exchange_segment.inspect}")
+      @logger.debug("DHAN:   instrument: #{instrument_type.inspect}")
+      @logger.debug("DHAN:   interval: #{interval_str.inspect}")
+      @logger.debug("DHAN:   from_date: #{from_date.inspect}")
+      @logger.debug("DHAN:   to_date: #{to_date.inspect}")
+
       result = DhanHQ::Models::HistoricalData.intraday(
-        security_id: security_id,
+        security_id: security_id_str,
         exchange_segment: exchange_segment,
         instrument: instrument_type,
-        interval: interval,
+        interval: interval_str,
         from_date: from_date,
         to_date: to_date
       )
+
+      @logger.debug("DHAN: HistoricalData.intraday returned: #{result.class}")
+      @logger.debug("DHAN: HistoricalData.intraday result structure: #{result.inspect}")
+      @logger.info("DHAN: Interval parameter '#{interval_str}' minutes was used for intraday data fetch")
+
+      # Handle different response formats
+      if result.is_a?(Hash)
+        # Check if it's a hash with data array inside
+        if result["data"] || result[:data]
+          data_array = result["data"] || result[:data]
+          @logger.debug("DHAN: Found data array in hash, size: #{data_array.is_a?(Array) ? data_array.length : 'N/A'}")
+          result = data_array.is_a?(Array) ? data_array : []
+        elsif result["ohlcv"] || result[:ohlcv]
+          data_array = result["ohlcv"] || result[:ohlcv]
+          @logger.debug("DHAN: Found ohlcv array in hash, size: #{data_array.is_a?(Array) ? data_array.length : 'N/A'}")
+          result = data_array.is_a?(Array) ? data_array : []
+        else
+          # Hash might contain error or other structure
+          @logger.warn("DHAN: Intraday API returned hash but no 'data' or 'ohlcv' key found. Keys: #{result.keys.inspect}")
+          return []
+        end
+      end
+
+      @logger.debug("DHAN: Final processed result type: #{result.class}, size: #{result.is_a?(Array) ? result.length : 'N/A'}")
     rescue DhanHQ::InputExceptionError => e
       @logger.warn("DHAN: API error for intraday data - #{e.message}")
+      @logger.warn("DHAN: Full error details: #{e.inspect}")
+      @logger.warn("DHAN: Interval used was: #{interval_str} minutes")
       @logger.warn("DHAN: Returning empty array - data may not be available for these dates")
       return []
     rescue => e
       @logger.error("DHAN: Unexpected error getting intraday data - #{e.class}: #{e.message}")
+      @logger.error("DHAN: Full error backtrace: #{e.backtrace.join("\n")}")
       return []
     end
 
     # Normalize response format
-    if result.is_a?(Array)
+    if result.is_a?(Array) && result.any?
       result.map do |row|
         {
-          timestamp: row["timestamp"] || row[:timestamp],
+          timestamp: row["timestamp"] || row[:timestamp] || row["date"] || row[:date],
           open: row["open"] || row[:open],
           high: row["high"] || row[:high],
           low: row["low"] || row[:low],
@@ -114,6 +230,7 @@ class DhanClient
         }
       end
     else
+      @logger.warn("DHAN: Intraday API returned empty or invalid data structure")
       []
     end
   end

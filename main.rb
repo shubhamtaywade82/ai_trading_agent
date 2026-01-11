@@ -45,6 +45,7 @@ agent = TradingAgent.new(
 logger.info("MAIN: Trading agent created")
 
 user_query = "Can I buy NIFTY CE today?"
+user_query = "Fing NIFTY instrument"
 logger.info("MAIN: Starting agent execution")
 logger.info("MAIN: User query: #{user_query}")
 

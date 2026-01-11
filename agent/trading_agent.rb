@@ -7,9 +7,11 @@ class TradingAgent
     @llm = llm
     @planner_router = planner_router
     @logger = AgentLogger.init
+    @user_query = nil  # Will be set in run method
   end
 
   def run(user_query:, account_context:)
+    @user_query = user_query  # Store for later use
     @logger.info("=" * 60)
     @logger.info("AGENT: Starting execution")
     @logger.info("AGENT: User query: #{user_query}")
@@ -42,8 +44,8 @@ class TradingAgent
             properties: {
               security_id: { type: "string", description: "Security ID from find_instrument result" },
               exchange_segment: { type: "string", description: "Exchange segment from find_instrument result" },
-              from_date: { type: "string", description: "Start date in YYYY-MM-DD format" },
-              to_date: { type: "string", description: "End date in YYYY-MM-DD format" }
+              from_date: { type: "string", description: "Start date in YYYY-MM-DD format. MUST be today (#{Date.today.strftime('%Y-%m-%d')}) or earlier. NEVER use future dates. Recommended: #{((Date.today - 30).strftime('%Y-%m-%d'))}" },
+              to_date: { type: "string", description: "End date in YYYY-MM-DD format. MUST be today (#{Date.today.strftime('%Y-%m-%d')}) or earlier. NEVER use future dates. Recommended: #{Date.today.strftime('%Y-%m-%d')}" }
             },
             required: ["security_id", "exchange_segment", "from_date", "to_date"]
           }
@@ -59,8 +61,8 @@ class TradingAgent
             properties: {
               security_id: { type: "string", description: "Security ID from find_instrument result" },
               exchange_segment: { type: "string", description: "Exchange segment from find_instrument result" },
-              from_date: { type: "string", description: "Start date in YYYY-MM-DD format" },
-              to_date: { type: "string", description: "End date in YYYY-MM-DD format" },
+              from_date: { type: "string", description: "Start date in YYYY-MM-DD format. MUST be today (#{Date.today.strftime('%Y-%m-%d')}) or earlier. NEVER use future dates. For intraday, use today's date: #{Date.today.strftime('%Y-%m-%d')}" },
+              to_date: { type: "string", description: "End date in YYYY-MM-DD format. MUST be today (#{Date.today.strftime('%Y-%m-%d')}) or earlier. NEVER use future dates. For intraday, use today's date: #{Date.today.strftime('%Y-%m-%d')}" },
               interval: { type: "string", description: "Interval in minutes: '1', '5', '15', '30', or '60' (default: '5')" }
             },
             required: ["security_id", "exchange_segment", "from_date", "to_date"]
@@ -100,12 +102,19 @@ class TradingAgent
       }
     ]
 
+    today_str = Date.today.strftime('%Y-%m-%d')
+    thirty_days_ago_str = (Date.today - 30).strftime('%Y-%m-%d')
+
     system_prompt = <<~PROMPT
       You are a trading analysis agent. You MUST use the available tools to get real market data.
+
+      ⚠️ CRITICAL: TODAY'S DATE IS #{today_str} - NEVER USE FUTURE DATES ⚠️
 
       ⚠️ STRICT ANTI-HALLUCINATION RULES ⚠️
 
       FORBIDDEN - DO NOT DO THESE:
+      ❌ NEVER describe or explain what tools to call - YOU MUST ACTUALLY CALL THEM
+      ❌ NEVER write "Step 1: Call find_instrument..." - INSTEAD, ACTUALLY CALL find_instrument
       ❌ NEVER use placeholders like [Current Price], [Today's Date], [Strike Price], [RSI Value], [MA Values]
       ❌ NEVER make up or estimate market data (prices, volumes, indicators, ratios)
       ❌ NEVER use generic statements like "approximately" or "around" without real data
@@ -113,28 +122,51 @@ class TradingAgent
       ❌ NEVER return a response that contains placeholder brackets [ ] or generic values
       ❌ NEVER calculate indicators (RSI, Bollinger Bands, etc.) without real OHLCV data
       ❌ NEVER assume or guess market conditions
+      ❌ NEVER use future dates - today is #{today_str}, so dates like 2026-01-12 are FORBIDDEN
 
       REQUIRED - YOU MUST DO THESE:
-      ✅ ALWAYS call tools in this exact order: find_instrument → get_daily_ohlcv → get_intraday_ohlcv → get_option_chain → get_ltp
+      ✅ ALWAYS ACTUALLY CALL tools (don't describe calling them) in this exact order: find_instrument → get_daily_ohlcv → get_intraday_ohlcv → get_option_chain → get_ltp
       ✅ ALWAYS use real data from tool responses - quote exact numbers from tool results
       ✅ ALWAYS state "Data not available" if a tool returns empty/null results
-      ✅ ALWAYS use actual dates in YYYY-MM-DD format (today is #{Date.today.strftime('%Y-%m-%d')})
+      ✅ ALWAYS use dates that are #{today_str} or earlier - NEVER use future dates
+      ✅ For get_daily_ohlcv: use from_date="#{thirty_days_ago_str}" and to_date="#{today_str}"
+      ✅ For get_intraday_ohlcv: use from_date="#{today_str}" and to_date="#{today_str}"
       ✅ ALWAYS wait for tool responses before making any analysis
       ✅ ALWAYS cite the source: "According to the data from [tool_name]..."
 
-      WORKFLOW (MANDATORY - COMPLETE ALL 5 STEPS):
-      Step 1: Call find_instrument(symbol="NIFTY", segment="IDX_I") - WAIT for result
-      Step 2: Use security_id from Step 1 → Call get_daily_ohlcv(security_id, exchange_segment, from_date, to_date) - WAIT for result
-      Step 3: Use security_id from Step 1 → Call get_intraday_ohlcv(security_id, exchange_segment, from_date, to_date) - WAIT for result
-      Step 4: Use security_id from Step 1 → Call get_option_chain(security_id, exchange_segment) - WAIT for result
-      Step 5: Use security_id from Step 1 → Call get_ltp(security_id, exchange_segment) - WAIT for result
-      Step 6: ONLY AFTER completing ALL 5 steps → Provide analysis with exact numbers from tool results
+      WORKFLOW - UNDERSTAND USER INTENT FIRST:
 
-      CRITICAL: You MUST complete ALL 5 tool calls (O1→O5) before providing final analysis.
-      - If a tool returns empty data, note it and CONTINUE to the next tool
-      - Do NOT stop early if one tool returns empty data
-      - You must call all 5 tools: find_instrument, get_daily_ohlcv, get_intraday_ohlcv, get_option_chain, get_ltp
-      - Only after calling all 5 tools can you provide the final analysis
+      ⚠️ CRITICAL: Analyze the user's query to determine what they want:
+
+      SIMPLE QUERIES (only call find_instrument):
+      - If user asks: "find instrument", "get instrument", "instrument details", "show instrument", "what is [symbol] instrument"
+      - ONLY call find_instrument tool
+      - Return the instrument details and STOP immediately
+      - DO NOT call any other tools (get_daily_ohlcv, get_intraday_ohlcv, get_option_chain, get_ltp)
+
+      ANALYSIS QUERIES (complete all 5 steps):
+      - If user asks: "can I buy", "should I buy", "analysis", "recommendation", "trading advice", "buy recommendation"
+      - THEN follow the FULL 5-step workflow:
+        Step 1: ACTUALLY CALL find_instrument(symbol="NIFTY", segment="IDX_I") - Use tool calling function, don't describe it
+        Step 2: Use security_id from Step 1 → ACTUALLY CALL get_daily_ohlcv(security_id, exchange_segment, from_date="#{thirty_days_ago_str}", to_date="#{today_str}")
+        Step 3: Use security_id from Step 1 → ACTUALLY CALL get_intraday_ohlcv(security_id, exchange_segment, from_date="#{today_str}", to_date="#{today_str}", interval="5")
+        Step 4: Use security_id from Step 1 → ACTUALLY CALL get_option_chain(security_id, exchange_segment)
+        Step 5: Use security_id from Step 1 → ACTUALLY CALL get_ltp(security_id, exchange_segment)
+        Step 6: ONLY AFTER completing ALL 5 steps → Provide analysis with exact numbers from tool results
+
+      CRITICAL RULES:
+      - If user only asks to find/get instrument details → ONLY call find_instrument, then STOP and return result
+      - If user asks for analysis/recommendation → THEN complete ALL 5 tool calls (O1→O5) before providing final analysis
+      - If a tool returns empty data, note it and CONTINUE to the next tool (only if doing full analysis)
+      - DO NOT describe the workflow - ACTUALLY EXECUTE IT by calling tools
+      - DO NOT call unnecessary tools if user only wants instrument information
+
+      DATE CONSTRAINTS:
+      - Today's date: #{today_str}
+      - 30 days ago: #{thirty_days_ago_str}
+      - NEVER use dates after #{today_str}
+      - For daily OHLCV: from_date should be #{thirty_days_ago_str}, to_date should be #{today_str}
+      - For intraday OHLCV: both from_date and to_date should be #{today_str}
 
       DATA AVAILABILITY:
       - If a tool returns empty data or error, state: "Data not available from [tool_name]"
@@ -145,10 +177,11 @@ class TradingAgent
       Before returning your final response, verify:
       1. All numbers come from tool responses (not invented)
       2. No placeholder text like [anything] exists
-      3. All dates are in YYYY-MM-DD format
+      3. All dates are #{today_str} or earlier (never future dates)
       4. All prices/values are exact numbers from tools
 
       REMEMBER: It's better to say "Data not available" than to hallucinate or estimate.
+      REMEMBER: DO NOT DESCRIBE CALLING TOOLS - ACTUALLY CALL THEM USING THE TOOL CALLING FUNCTION.
     PROMPT
 
     conversation = [
@@ -188,7 +221,7 @@ class TradingAgent
       # TERMINAL RESPONSE
       if response[:tool_calls].nil? || response[:tool_calls].empty?
         @logger.info("AGENT: Terminal response received (no tool calls)")
-        @logger.info("AGENT: Final content: #{response[:content][0..100]}...")
+        @logger.info("AGENT: Final content: #{response[:content]}")
 
         # STRICT CHECK: If no tools were called yet, force tool usage
         if tools_called_count == 0
@@ -202,8 +235,26 @@ class TradingAgent
           next  # Retry the loop
         end
 
-        # Check if LLM is describing actions instead of calling tools
-        if describes_tool_usage?(response[:content]) && tools_called_count < 5
+        # Check if user query is simple (just finding instrument) - CHECK THIS FIRST
+        user_query_lower = @user_query.downcase
+        is_simple_query = user_query_lower.match?(/find.*instrument|get.*instrument|instrument.*details|show.*instrument|what.*instrument|fing.*instrument/i)
+
+        @logger.debug("AGENT: Simple query check - query: '#{@user_query}', is_simple_query: #{is_simple_query}, tools_called_count: #{tools_called_count}")
+
+        # If it's a simple query and we've found the instrument, allow early termination
+        if is_simple_query && tools_called_count >= 1
+          find_instrument_called = conversation.any? { |msg| msg[:role] == "tool" && msg[:name] == "find_instrument" }
+          @logger.debug("AGENT: find_instrument_called check: #{find_instrument_called}")
+          if find_instrument_called
+            @logger.info("AGENT: Simple query detected - user only asked for instrument details. Allowing early termination.")
+            return response[:content]
+          else
+            @logger.debug("AGENT: Simple query detected but find_instrument not found in conversation yet")
+          end
+        end
+
+        # Check if LLM is describing actions instead of calling tools (only for analysis queries)
+        if describes_tool_usage?(response[:content]) && tools_called_count < 5 && !is_simple_query
           @logger.warn("AGENT: WARNING - LLM is describing tool usage instead of calling tools!")
           @logger.warn("AGENT: Tools called so far: #{tools_called_count}/5 - forcing next tool call")
 
@@ -227,8 +278,8 @@ class TradingAgent
           next  # Retry the loop
         end
 
-        # STRICT CHECK: Must complete all 5 steps before final response
-        if tools_called_count < 5
+        # STRICT CHECK: Must complete all 5 steps before final response (only for analysis queries)
+        if tools_called_count < 5 && !is_simple_query
           @logger.warn("AGENT: WARNING - Only #{tools_called_count}/5 tools called. Forcing continuation.")
 
           # Get the last tool result to extract security_id
@@ -326,7 +377,7 @@ class TradingAgent
         )
 
         @logger.info("AGENT: Tool '#{tool_call['name']}' completed")
-        @logger.debug("AGENT: Tool result: #{result.inspect[0..200]}...")
+        @logger.debug("AGENT: Tool result: #{result.inspect}")
 
         # Format tool result for Ollama - content should be a string (JSON)
         tool_content = if result.is_a?(Hash) || result.is_a?(Array)
@@ -349,16 +400,26 @@ class TradingAgent
   def describes_tool_usage?(content)
     # Check if LLM is describing tool calls instead of making them
     description_patterns = [
-      /call\s+(get_|find_)/i,
       /step\s+\d+.*call/i,
+      /step\s+\d+:.*call/i,
       /proceed with calling/i,
       /now.*call/i,
       /let's.*call/i,
       /should call/i,
-      /need to call/i
+      /need to call/i,
+      /will call/i,
+      /going to call/i,
+      /wait.*call/i,
+      /result from find_instrument/i,
+      /use security_id from step/i,
+      /according to the data.*step/i
     ]
 
-    description_patterns.any? { |pattern| content.match?(pattern) }
+    # Also check for markdown code blocks or formatted text that looks like descriptions
+    has_code_blocks = content.include?("```") || content.match?(/```json|```ruby|```python/i)
+    has_step_formatting = content.match?(/^Step \d+:/i) || content.match?(/Step \d+:/i)
+
+    description_patterns.any? { |pattern| content.match?(pattern) } || has_code_blocks || has_step_formatting
   end
 
   def contains_hallucinated_data?(content)
