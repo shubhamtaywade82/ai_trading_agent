@@ -9,7 +9,11 @@ class PlannerRouter
     @logger = AgentLogger.init
   end
 
-  def handle!(tool_call:, account_context:)
+  def current_step
+    @planner.current_step
+  end
+
+  def handle!(tool_call:, account_context:, advance: true, allow_intraday_at_o4: false)
     tool = tool_call["name"]
     args = tool_call["arguments"]
 
@@ -19,7 +23,8 @@ class PlannerRouter
     ToolGuard.validate!(
       planner: @planner,
       tool: tool,
-      payload: args
+      payload: args,
+      allow_intraday_at_o4: allow_intraday_at_o4
     )
 
     @logger.info("PLANNER: Validation passed for '#{tool}'")
@@ -32,11 +37,14 @@ class PlannerRouter
     )
 
     @logger.info("PLANNER: Tool execution completed")
-    @logger.info("PLANNER: Advancing from step #{@planner.current_step}")
 
-    @planner.advance!
-
-    @logger.info("PLANNER: Advanced to step: #{@planner.current_step}")
+    if advance
+      @logger.info("PLANNER: Advancing from step #{@planner.current_step}")
+      @planner.advance!
+      @logger.info("PLANNER: Advanced to step: #{@planner.current_step}")
+    else
+      @logger.info("PLANNER: Not advancing - staying at step #{@planner.current_step} (more intervals needed)")
+    end
 
     result
   end

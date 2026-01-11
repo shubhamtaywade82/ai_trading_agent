@@ -175,7 +175,9 @@ class TradingAgent
           - "15 minute" or "15min" → interval="15"
           - from_date MUST be < to_date, from_date MUST be < last trading day (e.g., from_date="#{last_trading_day_minus_one_str}", to_date="#{today_str}")
       - Step 3: If user asks for multiple intervals, call get_intraday_ohlcv ONCE per interval using tool_calls, WAITING for each result before calling the next
-      - Return the OHLCV data and STOP (do NOT call get_option_chain or get_ltp)
+      - Step 4: After all OHLCV data is fetched, CONTINUE to get_option_chain(security_id, exchange_segment)
+      - Step 5: Then call get_ltp(security_id, exchange_segment)
+      - Step 6: Provide final analysis with all the data collected
       - ⚠️ NEVER use placeholders like <security_id> or <from find_instrument result> - you MUST use the actual value (e.g., "13") from the previous tool result
       - ⚠️ NEVER call multiple tools at once - call ONE tool using tool_calls, wait for result, then call the next
       - ⚠️ NEVER describe tools or write code examples - ACTUALLY CALL THEM using tool_calls
@@ -192,7 +194,7 @@ class TradingAgent
 
       CRITICAL RULES:
       - If user only asks to find/get instrument details → ONLY call find_instrument, then STOP
-      - If user asks for OHLCV data → Call find_instrument, then get_daily_ohlcv and/or get_intraday_ohlcv (with requested intervals), then STOP
+      - If user asks for OHLCV data → Call find_instrument, then get_daily_ohlcv and/or get_intraday_ohlcv (with requested intervals), then CONTINUE to get_option_chain and get_ltp, then provide analysis
       - If user asks for analysis/recommendation → THEN complete ALL 5 tool calls (O1→O5) before providing final analysis
       - If a tool returns empty data, note it and CONTINUE to the next tool (only if doing full analysis)
       - DO NOT describe the workflow - ACTUALLY EXECUTE IT by calling tools
@@ -264,8 +266,100 @@ class TradingAgent
         @logger.info("AGENT: Terminal response received (no tool calls)")
         @logger.info("AGENT: Final content: #{response[:content]}")
 
+        # Check if response is invalid (e.g., empty JSON object, malformed response)
+        if response[:content] && (response[:content].strip == '{"name": "", "parameters": null}' ||
+                                  response[:content].strip.match?(/^\s*\{\s*"name"\s*:\s*""/i) ||
+                                  response[:content].strip.match?(/^\s*\{\s*"name"\s*:\s*""\s*,\s*"parameters"\s*:\s*null/i))
+          @logger.warn("AGENT: WARNING - LLM returned invalid/malformed response: #{response[:content].inspect}")
+          @logger.warn("AGENT: This appears to be an empty tool call format. Forcing retry.")
+
+          user_query_lower = @user_query.downcase
+          is_ohlcv_query = user_query_lower.match?(/ohlcv|daily.*ohlcv|intraday.*ohlcv|get.*ohlcv|show.*ohlcv|ohlcv.*data|price.*data|historical.*data|1.*minute|5.*minute|15.*minute|1min|5min|15min/i)
+
+          if is_ohlcv_query && tools_called_count >= 1
+            # Extract security_id and exchange_segment
+            security_id = "13"
+            exchange_segment = "IDX_I"
+            find_result = conversation.find { |msg| msg[:role] == "tool" && msg[:name] == "find_instrument" }
+            if find_result && find_result[:content]
+              begin
+                find_data = JSON.parse(find_result[:content])
+                security_id = find_data["security_id"] || find_data[:security_id] || "13"
+                exchange_segment = find_data["exchange_segment"] || find_data[:exchange_segment] || "IDX_I"
+              rescue
+              end
+            end
+
+            # Check what's missing
+            daily_ohlcv_called = conversation.any? { |msg| msg[:role] == "tool" && msg[:name] == "get_daily_ohlcv" }
+            wants_daily = user_query_lower.match?(/daily/i)
+
+            # Get fetched intervals
+            fetched_intervals = []
+            conversation.each do |msg|
+              if msg[:role] == "assistant" && msg[:tool_calls]
+                msg[:tool_calls].each do |tc|
+                  tool_name = tc["name"] || tc[:name] || ""
+                  if tool_name == "get_intraday_ohlcv"
+                    args = tc["arguments"] || tc[:arguments] || {}
+                    interval = args["interval"] || args[:interval]
+                    if interval
+                      fetched_intervals << interval.to_s
+                    end
+                  end
+                end
+              end
+            end
+
+            # Determine next tool to call
+            # First check if find_instrument was called
+            find_instrument_called = conversation.any? { |msg| msg[:role] == "tool" && msg[:name] == "find_instrument" }
+
+            if !find_instrument_called
+              instruction = "You returned an invalid response. You MUST call find_instrument(symbol='NIFTY', segment='IDX_I') using the tool calling function (tool_calls) first."
+            elsif wants_daily && !daily_ohlcv_called
+              today = Date.today
+              thirty_days_ago = today - 30
+              instruction = "You returned an invalid response. You MUST call get_daily_ohlcv(security_id='#{security_id}', exchange_segment='#{exchange_segment}', from_date='#{thirty_days_ago.strftime('%Y-%m-%d')}', to_date='#{today.strftime('%Y-%m-%d')}') using the tool calling function (tool_calls)."
+            else
+              # Need intraday data
+              requested_intervals = []
+              if user_query_lower.match?(/1.*minute|1min/i)
+                requested_intervals << "1"
+              end
+              if user_query_lower.match?(/5.*minute|5min/i)
+                requested_intervals << "5"
+              end
+              if user_query_lower.match?(/15.*minute|15min/i)
+                requested_intervals << "15"
+              end
+
+              missing_intervals = requested_intervals.reject { |interval| fetched_intervals.include?(interval) }
+              next_interval = missing_intervals.first || "1"
+
+              today = Date.today
+              last_trading_day_obj = TradingAgent.last_trading_day(today)
+              last_trading_day_minus_one_obj = last_trading_day_obj - 1
+              while last_trading_day_minus_one_obj.saturday? || last_trading_day_minus_one_obj.sunday?
+                last_trading_day_minus_one_obj -= 1
+              end
+
+              instruction = "You returned an invalid response. You MUST call get_intraday_ohlcv(security_id='#{security_id}', exchange_segment='#{exchange_segment}', from_date='#{last_trading_day_minus_one_obj.strftime('%Y-%m-%d')}', to_date='#{last_trading_day_obj.strftime('%Y-%m-%d')}', interval='#{next_interval}') using the tool calling function (tool_calls). Missing intervals: #{missing_intervals.inspect}. Call them ONE AT A TIME."
+            end
+
+            conversation << {
+              role: "user",
+              content: "STOP. #{instruction} Your previous response was invalid. You MUST use the tool calling function (tool_calls) with actual values, not return empty JSON objects."
+            }
+            next  # Retry the loop
+          end
+        end
+
         # STRICT CHECK: If no tools were called yet, force tool usage
-        if tools_called_count == 0
+        # But first check if find_instrument was already called in conversation history
+        find_instrument_called = conversation.any? { |msg| msg[:role] == "tool" && msg[:name] == "find_instrument" }
+
+        if tools_called_count == 0 && !find_instrument_called
           @logger.warn("AGENT: WARNING - No tools called yet but LLM returned response!")
           @logger.warn("AGENT: This is FORBIDDEN - forcing tool usage")
 
@@ -274,6 +368,8 @@ class TradingAgent
             content: "STOP. You MUST call tools to get real data. You cannot provide analysis without calling find_instrument first. Call find_instrument(symbol='NIFTY', segment='IDX_I') immediately."
           }
           next  # Retry the loop
+        elsif tools_called_count == 0 && find_instrument_called
+          @logger.debug("AGENT: find_instrument already called, but tools_called_count is 0. This may be a tracking issue, but continuing...")
         end
 
         # Check if user query is simple (just finding instrument) - CHECK THIS FIRST
@@ -299,17 +395,81 @@ class TradingAgent
         if is_ohlcv_query && tools_called_count >= 1
           find_instrument_called = conversation.any? { |msg| msg[:role] == "tool" && msg[:name] == "find_instrument" }
           daily_ohlcv_called = conversation.any? { |msg| msg[:role] == "tool" && msg[:name] == "get_daily_ohlcv" }
-          intraday_ohlcv_called = conversation.any? { |msg| msg[:role] == "tool" && msg[:name] == "get_intraday_ohlcv" }
 
           # Check if user wants daily data
           wants_daily = user_query_lower.match?(/daily/i)
-          # Check if user wants intraday data (and which intervals)
-          wants_intraday = user_query_lower.match?(/intraday|1.*minute|5.*minute|15.*minute|1min|5min|15min/i)
 
-          # If user asked for daily and we've called it, or if user asked for intraday and we've called it, allow termination
-          if find_instrument_called && ((wants_daily && daily_ohlcv_called) || (wants_intraday && intraday_ohlcv_called) || (!wants_daily && !wants_intraday && (daily_ohlcv_called || intraday_ohlcv_called)))
-            @logger.info("AGENT: OHLCV query detected - user asked for OHLCV data. Allowing early termination after OHLCV tools.")
-            return response[:content]
+          # Parse which specific intraday intervals the user requested
+          requested_intervals = []
+          if user_query_lower.match?(/1.*minute|1min/i)
+            requested_intervals << "1"
+          end
+          if user_query_lower.match?(/5.*minute|5min/i)
+            requested_intervals << "5"
+          end
+          if user_query_lower.match?(/15.*minute|15min/i)
+            requested_intervals << "15"
+          end
+          if user_query_lower.match?(/30.*minute|30min/i)
+            requested_intervals << "30"
+          end
+          if user_query_lower.match?(/60.*minute|60min|1.*hour|1h/i)
+            requested_intervals << "60"
+          end
+          # If user said "intraday" but didn't specify intervals, assume they want at least one
+          wants_intraday = user_query_lower.match?(/intraday/i)
+          if wants_intraday && requested_intervals.empty?
+            # User asked for intraday but didn't specify - don't allow termination until at least one intraday call
+            requested_intervals = ["any"]  # Special marker meaning "at least one intraday call needed"
+          end
+
+          # Check which intraday intervals have been fetched by looking at tool calls in conversation
+          # Tool calls are stored in normalized format: {"name": "...", "arguments": {...}}
+          fetched_intervals = []
+          conversation.each do |msg|
+            # Look for assistant messages that contain tool_calls
+            if msg[:role] == "assistant" && msg[:tool_calls]
+              msg[:tool_calls].each do |tc|
+                # Tool calls are normalized to {"name": "...", "arguments": {...}} format
+                tool_name = tc["name"] || tc[:name] || ""
+                if tool_name == "get_intraday_ohlcv"
+                  args = tc["arguments"] || tc[:arguments] || {}
+                  # Handle both string and symbol keys
+                  interval = args["interval"] || args[:interval]
+                  if interval
+                    fetched_intervals << interval.to_s
+                  end
+                end
+              end
+            end
+          end
+
+          # Also check tool results for interval info (if stored)
+          # For now, if we see any intraday call, we'll check if all requested intervals are covered
+          intraday_ohlcv_called = conversation.any? { |msg| msg[:role] == "tool" && msg[:name] == "get_intraday_ohlcv" }
+
+          # Determine if all requested data has been fetched
+          daily_satisfied = !wants_daily || daily_ohlcv_called
+
+          intraday_satisfied = if requested_intervals.empty?
+            !wants_intraday  # If no specific intervals requested and no "intraday" keyword, intraday is satisfied
+          elsif requested_intervals == ["any"]
+            intraday_ohlcv_called  # At least one intraday call needed
+          else
+            # Check if all requested intervals have been fetched
+            requested_intervals.all? { |interval| fetched_intervals.include?(interval) }
+          end
+
+          @logger.debug("AGENT: OHLCV completion check - wants_daily: #{wants_daily}, daily_called: #{daily_ohlcv_called}, requested_intervals: #{requested_intervals.inspect}, fetched_intervals: #{fetched_intervals.inspect}, intraday_called: #{intraday_ohlcv_called}")
+          @logger.debug("AGENT: OHLCV completion - daily_satisfied: #{daily_satisfied}, intraday_satisfied: #{intraday_satisfied}")
+
+          # After OHLCV data is fetched, continue to next steps (get_option_chain, get_ltp)
+          # Don't terminate early - let the agent continue with the full workflow
+          if find_instrument_called && daily_satisfied && intraday_satisfied
+            @logger.info("AGENT: OHLCV query - all requested OHLCV data has been fetched. Continuing to next steps (get_option_chain, get_ltp).")
+            # Don't return - continue to next steps
+          elsif find_instrument_called && (daily_ohlcv_called || intraday_ohlcv_called)
+            @logger.debug("AGENT: OHLCV query in progress - some data fetched but not all requested intervals. Continuing...")
           end
         end
 
@@ -335,22 +495,42 @@ class TradingAgent
           today = Date.today
           thirty_days_ago = today - 30
 
-          # Determine which tool should be called next
-          if tools_called_count == 0
-            instruction = "You MUST call find_instrument(symbol='NIFTY', segment='IDX_I') using the tool calling function. Do NOT describe it, do NOT write code, do NOT use placeholders - ACTUALLY CALL IT."
-          elsif tools_called_count == 1 && is_ohlcv_query
-            wants_daily = @user_query.downcase.match?(/daily/i)
-            if wants_daily
-              instruction = "You MUST call get_daily_ohlcv(security_id='#{security_id}', exchange_segment='#{exchange_segment}', from_date='#{thirty_days_ago.strftime('%Y-%m-%d')}', to_date='#{today.strftime('%Y-%m-%d')}') using the tool calling function. Use the actual security_id='#{security_id}' and exchange_segment='#{exchange_segment}' from the previous result, not a placeholder."
+          # Determine which tool should be called next based on current step
+          current_step = @planner_router.current_step
+          find_instrument_called = conversation.any? { |msg| msg[:role] == "tool" && msg[:name] == "find_instrument" }
+
+          case current_step
+          when :O1
+            if !find_instrument_called
+              instruction = "You MUST call find_instrument(symbol='NIFTY', segment='IDX_I') using the tool calling function. Do NOT describe it, do NOT write code, do NOT use placeholders - ACTUALLY CALL IT."
             else
-              instruction = "You MUST call get_intraday_ohlcv(security_id='#{security_id}', exchange_segment='#{exchange_segment}', from_date='#{today.strftime('%Y-%m-%d')}', to_date='#{today.strftime('%Y-%m-%d')}', interval='1') using the tool calling function. Use the actual security_id='#{security_id}' and exchange_segment='#{exchange_segment}' from the previous result."
+              instruction = "You described calling a tool but did not actually call it. You MUST use the tool calling function (tool_calls), not describe it in text, not write code examples, not use placeholders. ACTUALLY CALL THE TOOL with real values from previous tool results."
             end
+          when :O2
+            # Should call get_daily_ohlcv
+            instruction = "You MUST call get_daily_ohlcv(security_id='#{security_id}', exchange_segment='#{exchange_segment}', from_date='#{thirty_days_ago.strftime('%Y-%m-%d')}', to_date='#{today.strftime('%Y-%m-%d')}') using the tool calling function. Use the actual security_id='#{security_id}' and exchange_segment='#{exchange_segment}' from the previous result, not a placeholder."
+          when :O3
+            # Should call get_intraday_ohlcv
+            today = Date.today
+            last_trading_day_obj = TradingAgent.last_trading_day(today)
+            last_trading_day_minus_one_obj = last_trading_day_obj - 1
+            while last_trading_day_minus_one_obj.saturday? || last_trading_day_minus_one_obj.sunday?
+              last_trading_day_minus_one_obj -= 1
+            end
+            instruction = "You MUST call get_intraday_ohlcv(security_id='#{security_id}', exchange_segment='#{exchange_segment}', from_date='#{last_trading_day_minus_one_obj.strftime('%Y-%m-%d')}', to_date='#{last_trading_day_obj.strftime('%Y-%m-%d')}', interval='5') using the tool calling function. Use the actual security_id='#{security_id}' and exchange_segment='#{exchange_segment}' from the previous result."
+          when :O4
+            # Should call get_option_chain
+            instruction = "You MUST call get_option_chain(security_id='#{security_id}', exchange_segment='#{exchange_segment}') using the tool calling function. Use the actual security_id='#{security_id}' and exchange_segment='#{exchange_segment}' from the previous result."
+          when :O5
+            # Should call get_ltp
+            instruction = "You MUST call get_ltp(security_id='#{security_id}', exchange_segment='#{exchange_segment}') using the tool calling function. Use the actual security_id='#{security_id}' and exchange_segment='#{exchange_segment}' from the previous result."
           else
             instruction = "You described calling a tool but did not actually call it. You MUST use the tool calling function (tool_calls), not describe it in text, not write code examples, not use placeholders. ACTUALLY CALL THE TOOL with real values from previous tool results."
           end
 
           # Provide explicit example of tool calling format
-          tool_call_example = if tools_called_count == 0
+          find_instrument_called = conversation.any? { |msg| msg[:role] == "tool" && msg[:name] == "find_instrument" }
+          tool_call_example = if tools_called_count == 0 && !find_instrument_called
             "Use tool_calls like: {\"function\": {\"name\": \"find_instrument\", \"arguments\": {\"symbol\": \"NIFTY\", \"segment\": \"IDX_I\"}}}"
           elsif tools_called_count == 1 && is_ohlcv_query && @user_query.downcase.match?(/daily/i)
             "Use tool_calls like: {\"function\": {\"name\": \"get_daily_ohlcv\", \"arguments\": {\"security_id\": \"#{security_id}\", \"exchange_segment\": \"#{exchange_segment}\", \"from_date\": \"#{thirty_days_ago.strftime('%Y-%m-%d')}\", \"to_date\": \"#{today.strftime('%Y-%m-%d')}\"}}}"
@@ -431,6 +611,110 @@ class TradingAgent
         end
 
         @logger.info("AGENT: Response validated - no hallucination detected")
+
+        # CRITICAL: If this is an OHLCV query and not all requested intervals have been fetched, force continuation
+        if is_ohlcv_query && tools_called_count >= 1
+          find_instrument_called = conversation.any? { |msg| msg[:role] == "tool" && msg[:name] == "find_instrument" }
+          daily_ohlcv_called = conversation.any? { |msg| msg[:role] == "tool" && msg[:name] == "get_daily_ohlcv" }
+
+          wants_daily = user_query_lower.match?(/daily/i)
+          requested_intervals = []
+          if user_query_lower.match?(/1.*minute|1min/i)
+            requested_intervals << "1"
+          end
+          if user_query_lower.match?(/5.*minute|5min/i)
+            requested_intervals << "5"
+          end
+          if user_query_lower.match?(/15.*minute|15min/i)
+            requested_intervals << "15"
+          end
+          if user_query_lower.match?(/30.*minute|30min/i)
+            requested_intervals << "30"
+          end
+          if user_query_lower.match?(/60.*minute|60min|1.*hour|1h/i)
+            requested_intervals << "60"
+          end
+          wants_intraday = user_query_lower.match?(/intraday/i)
+          if wants_intraday && requested_intervals.empty?
+            requested_intervals = ["any"]
+          end
+
+          # Check which intervals have been fetched
+          fetched_intervals = []
+          conversation.each do |msg|
+            if msg[:role] == "assistant" && msg[:tool_calls]
+              msg[:tool_calls].each do |tc|
+                tool_name = tc["name"] || tc[:name] || ""
+                if tool_name == "get_intraday_ohlcv"
+                  args = tc["arguments"] || tc[:arguments] || {}
+                  interval = args["interval"] || args[:interval]
+                  if interval
+                    fetched_intervals << interval.to_s
+                  end
+                end
+              end
+            end
+          end
+
+          intraday_ohlcv_called = conversation.any? { |msg| msg[:role] == "tool" && msg[:name] == "get_intraday_ohlcv" }
+
+          daily_satisfied = !wants_daily || daily_ohlcv_called
+          intraday_satisfied = if requested_intervals.empty?
+            !wants_intraday
+          elsif requested_intervals == ["any"]
+            intraday_ohlcv_called
+          else
+            requested_intervals.all? { |interval| fetched_intervals.include?(interval) }
+          end
+
+          if find_instrument_called && !(daily_satisfied && intraday_satisfied)
+            @logger.warn("AGENT: WARNING - OHLCV query incomplete! Daily satisfied: #{daily_satisfied}, Intraday satisfied: #{intraday_satisfied}")
+            @logger.warn("AGENT: Requested intervals: #{requested_intervals.inspect}, Fetched intervals: #{fetched_intervals.inspect}")
+            @logger.warn("AGENT: Forcing continuation to fetch missing data")
+
+            # Extract security_id and exchange_segment
+            security_id = "13"
+            exchange_segment = "IDX_I"
+            find_result = conversation.find { |msg| msg[:role] == "tool" && msg[:name] == "find_instrument" }
+            if find_result && find_result[:content]
+              begin
+                find_data = JSON.parse(find_result[:content])
+                security_id = find_data["security_id"] || find_data[:security_id] || "13"
+                exchange_segment = find_data["exchange_segment"] || find_data[:exchange_segment] || "IDX_I"
+              rescue
+              end
+            end
+
+            # Determine which tool to call next
+            missing_intervals = requested_intervals.reject { |interval| fetched_intervals.include?(interval) }
+            next_interval = missing_intervals.first || "1"  # Default to "1" if no specific interval requested
+
+            today = Date.today
+            last_trading_day_obj = TradingAgent.last_trading_day(today)
+            last_trading_day_minus_one_obj = last_trading_day_obj - 1
+            while last_trading_day_minus_one_obj.saturday? || last_trading_day_minus_one_obj.sunday?
+              last_trading_day_minus_one_obj -= 1
+            end
+
+            if !daily_satisfied && !daily_ohlcv_called
+              # Need to call get_daily_ohlcv
+              thirty_days_ago = today - 30
+              instruction = "You MUST call get_daily_ohlcv(security_id='#{security_id}', exchange_segment='#{exchange_segment}', from_date='#{thirty_days_ago.strftime('%Y-%m-%d')}', to_date='#{today.strftime('%Y-%m-%d')}') using the tool calling function."
+            elsif !intraday_satisfied
+              # Need to call get_intraday_ohlcv for missing intervals
+              instruction = "You MUST call get_intraday_ohlcv(security_id='#{security_id}', exchange_segment='#{exchange_segment}', from_date='#{last_trading_day_minus_one_obj.strftime('%Y-%m-%d')}', to_date='#{last_trading_day_obj.strftime('%Y-%m-%d')}', interval='#{next_interval}') using the tool calling function. You still need to fetch intervals: #{missing_intervals.inspect}. Call them ONE AT A TIME."
+            else
+              instruction = "Continue fetching the remaining OHLCV data."
+            end
+
+            conversation << {
+              role: "user",
+              content: "STOP. #{instruction} You have NOT completed fetching all requested OHLCV data. Requested intervals: #{requested_intervals.inspect}, Fetched: #{fetched_intervals.inspect}. You MUST call the remaining tools using the tool calling function (tool_calls), not describe them."
+            }
+            next  # Retry the loop
+          end
+        end
+
         return response[:content]
       end
 
@@ -467,6 +751,12 @@ class TradingAgent
 
       @logger.info("AGENT: Processing #{response[:tool_calls].length} tool call(s)")
 
+      # Store the assistant message with tool_calls in conversation for tracking
+      conversation << {
+        role: "assistant",
+        tool_calls: response[:tool_calls]
+      }
+
       response[:tool_calls].each_with_index do |tool_call, idx|
         tool_name = tool_call["name"] || tool_call[:name] || ""
         tool_args = tool_call["arguments"] || tool_call[:arguments] || {}
@@ -479,9 +769,88 @@ class TradingAgent
           @logger.error("AGENT: ERROR - Tool call has empty name! Raw: #{tool_call.inspect}")
           @logger.error("AGENT: Skipping invalid tool call and requesting retry")
 
+          # Determine which tool should be called based on current step
+          current_step = @planner_router.current_step
+          find_instrument_called = conversation.any? { |msg| msg[:role] == "tool" && msg[:name] == "find_instrument" }
+
+          instruction = case current_step
+          when :O1
+            "The tool call you made was invalid (empty tool name). Please call find_instrument(symbol='NIFTY', segment='IDX_I') with the correct format."
+          when :O2
+            # Extract security_id from previous result
+            security_id = "13"
+            exchange_segment = "IDX_I"
+            find_result = conversation.find { |msg| msg[:role] == "tool" && msg[:name] == "find_instrument" }
+            if find_result && find_result[:content]
+              begin
+                find_data = JSON.parse(find_result[:content])
+                security_id = find_data["security_id"] || find_data[:security_id] || "13"
+                exchange_segment = find_data["exchange_segment"] || find_data[:exchange_segment] || "IDX_I"
+              rescue
+              end
+            end
+            today = Date.today
+            thirty_days_ago = today - 30
+            "The tool call you made was invalid (empty tool name). Please call get_daily_ohlcv(security_id='#{security_id}', exchange_segment='#{exchange_segment}', from_date='#{thirty_days_ago.strftime('%Y-%m-%d')}', to_date='#{today.strftime('%Y-%m-%d')}') with the correct format."
+          when :O3
+            # Extract security_id from previous result
+            security_id = "13"
+            exchange_segment = "IDX_I"
+            find_result = conversation.find { |msg| msg[:role] == "tool" && msg[:name] == "find_instrument" }
+            if find_result && find_result[:content]
+              begin
+                find_data = JSON.parse(find_result[:content])
+                security_id = find_data["security_id"] || find_data[:security_id] || "13"
+                exchange_segment = find_data["exchange_segment"] || find_data[:exchange_segment] || "IDX_I"
+              rescue
+              end
+            end
+            today = Date.today
+            last_trading_day_obj = TradingAgent.last_trading_day(today)
+            last_trading_day_minus_one_obj = last_trading_day_obj - 1
+            while last_trading_day_minus_one_obj.saturday? || last_trading_day_minus_one_obj.sunday?
+              last_trading_day_minus_one_obj -= 1
+            end
+            "The tool call you made was invalid (empty tool name). Please call get_intraday_ohlcv(security_id='#{security_id}', exchange_segment='#{exchange_segment}', from_date='#{last_trading_day_minus_one_obj.strftime('%Y-%m-%d')}', to_date='#{last_trading_day_obj.strftime('%Y-%m-%d')}', interval='5') with the correct format."
+          when :O4
+            # Extract security_id from previous result
+            security_id = "13"
+            exchange_segment = "IDX_I"
+            find_result = conversation.find { |msg| msg[:role] == "tool" && msg[:name] == "find_instrument" }
+            if find_result && find_result[:content]
+              begin
+                find_data = JSON.parse(find_result[:content])
+                security_id = find_data["security_id"] || find_data[:security_id] || "13"
+                exchange_segment = find_data["exchange_segment"] || find_data[:exchange_segment] || "IDX_I"
+              rescue
+              end
+            end
+            "The tool call you made was invalid (empty tool name). Please call get_option_chain(security_id='#{security_id}', exchange_segment='#{exchange_segment}') with the correct format."
+          when :O5
+            # Extract security_id from previous result
+            security_id = "13"
+            exchange_segment = "IDX_I"
+            find_result = conversation.find { |msg| msg[:role] == "tool" && msg[:name] == "find_instrument" }
+            if find_result && find_result[:content]
+              begin
+                find_data = JSON.parse(find_result[:content])
+                security_id = find_data["security_id"] || find_data[:security_id] || "13"
+                exchange_segment = find_data["exchange_segment"] || find_data[:exchange_segment] || "IDX_I"
+              rescue
+              end
+            end
+            "The tool call you made was invalid (empty tool name). Please call get_ltp(security_id='#{security_id}', exchange_segment='#{exchange_segment}') with the correct format."
+          else
+            if !find_instrument_called
+              "The tool call you made was invalid (empty tool name). Please call find_instrument(symbol='NIFTY', segment='IDX_I') with the correct format."
+            else
+              "The tool call you made was invalid (empty tool name). Please call the appropriate tool for the current step with the correct format."
+            end
+          end
+
           conversation << {
             role: "user",
-            content: "The tool call you made was invalid (empty tool name). Please call find_instrument(symbol='NIFTY', segment='IDX_I') with the correct format."
+            content: instruction
           }
           next
         end
@@ -499,9 +868,153 @@ class TradingAgent
           next
         end
 
+        # Determine if we should advance the planner
+        # For OHLCV queries, stay at step O3 if we're calling get_intraday_ohlcv and there are more intervals to fetch
+        should_advance = true
+        user_query_lower = @user_query.downcase
+        is_ohlcv_query_check = user_query_lower.match?(/ohlcv|daily.*ohlcv|intraday.*ohlcv|get.*ohlcv|show.*ohlcv|ohlcv.*data|price.*data|historical.*data|1.*minute|5.*minute|15.*minute|1min|5min|15min/i)
+
+        if is_ohlcv_query_check && tool_name == "get_intraday_ohlcv"
+          # Check which intervals have been requested
+          requested_intervals = []
+          if user_query_lower.match?(/1.*minute|1min/i)
+            requested_intervals << "1"
+          end
+          if user_query_lower.match?(/5.*minute|5min/i)
+            requested_intervals << "5"
+          end
+          if user_query_lower.match?(/15.*minute|15min/i)
+            requested_intervals << "15"
+          end
+          if user_query_lower.match?(/30.*minute|30min/i)
+            requested_intervals << "30"
+          end
+          if user_query_lower.match?(/60.*minute|60min|1.*hour|1h/i)
+            requested_intervals << "60"
+          end
+
+          @logger.debug("AGENT: Checking if should advance - requested_intervals: #{requested_intervals.inspect}")
+
+          # Check which intervals have been fetched so far (including this one)
+          fetched_intervals = []
+          conversation.each do |msg|
+            if msg[:role] == "assistant" && msg[:tool_calls]
+              msg[:tool_calls].each do |tc|
+                tool_name_check = tc["name"] || tc[:name] || ""
+                if tool_name_check == "get_intraday_ohlcv"
+                  args = tc["arguments"] || tc[:arguments] || {}
+                  # Handle both hash and string JSON formats
+                  if args.is_a?(String)
+                    begin
+                      args = JSON.parse(args)
+                    rescue
+                      args = {}
+                    end
+                  end
+                  interval = args["interval"] || args[:interval]
+                  if interval
+                    fetched_intervals << interval.to_s
+                  end
+                end
+              end
+            end
+          end
+          # Also include the current interval being called
+          current_interval = tool_args["interval"] || tool_args[:interval]
+          if current_interval
+            fetched_intervals << current_interval.to_s
+          end
+
+          # Remove duplicates
+          fetched_intervals.uniq!
+
+          @logger.debug("AGENT: Fetched intervals so far: #{fetched_intervals.inspect}")
+
+          # If there are more intervals to fetch, don't advance
+          if !requested_intervals.empty?
+            missing_intervals = requested_intervals.reject { |interval| fetched_intervals.include?(interval) }
+            @logger.debug("AGENT: Missing intervals: #{missing_intervals.inspect}")
+            if !missing_intervals.empty?
+              should_advance = false
+              @logger.info("AGENT: Staying at step O3 - more intervals to fetch: #{missing_intervals.inspect}")
+            else
+              should_advance = true
+              @logger.info("AGENT: All requested intervals fetched - will advance to step O4 (get_option_chain)")
+            end
+          else
+            # If no specific intervals requested but intraday was called, advance
+            should_advance = true
+            @logger.info("AGENT: Intraday data fetched - will advance to step O4 (get_option_chain)")
+          end
+        end
+
+        # Check if we need to allow get_intraday_ohlcv at O4 (if planner is at O4 but we still need intervals)
+        allow_intraday_at_o4 = false
+        if is_ohlcv_query_check && tool_name == "get_intraday_ohlcv"
+          current_step = @planner_router.current_step
+          if current_step == :O4
+            # Check if there are still missing intervals
+            requested_intervals = []
+            if user_query_lower.match?(/1.*minute|1min/i)
+              requested_intervals << "1"
+            end
+            if user_query_lower.match?(/5.*minute|5min/i)
+              requested_intervals << "5"
+            end
+            if user_query_lower.match?(/15.*minute|15min/i)
+              requested_intervals << "15"
+            end
+            if user_query_lower.match?(/30.*minute|30min/i)
+              requested_intervals << "30"
+            end
+            if user_query_lower.match?(/60.*minute|60min|1.*hour|1h/i)
+              requested_intervals << "60"
+            end
+
+            # Check which intervals have been fetched
+            fetched_intervals = []
+            conversation.each do |msg|
+              if msg[:role] == "assistant" && msg[:tool_calls]
+                msg[:tool_calls].each do |tc|
+                  tool_name_check = tc["name"] || tc[:name] || ""
+                  if tool_name_check == "get_intraday_ohlcv"
+                    args = tc["arguments"] || tc[:arguments] || {}
+                    if args.is_a?(String)
+                      begin
+                        args = JSON.parse(args)
+                      rescue
+                        args = {}
+                      end
+                    end
+                    interval = args["interval"] || args[:interval]
+                    if interval
+                      fetched_intervals << interval.to_s
+                    end
+                  end
+                end
+              end
+            end
+            # Include current interval
+            current_interval = tool_args["interval"] || tool_args[:interval]
+            if current_interval
+              fetched_intervals << current_interval.to_s
+            end
+            fetched_intervals.uniq!
+
+            missing_intervals = requested_intervals.reject { |interval| fetched_intervals.include?(interval) }
+            if !missing_intervals.empty?
+              allow_intraday_at_o4 = true
+              @logger.info("AGENT: Planner is at O4 but still need intervals #{missing_intervals.inspect}. Allowing get_intraday_ohlcv at O4.")
+            end
+          end
+        end
+
+        @logger.debug("AGENT: Calling planner with advance=#{should_advance} for tool #{tool_name}, allow_intraday_at_o4=#{allow_intraday_at_o4}")
         result = @planner_router.handle!(
           tool_call: { "name" => tool_name, "arguments" => tool_args },
-          account_context: account_context
+          account_context: account_context,
+          advance: should_advance,
+          allow_intraday_at_o4: allow_intraday_at_o4
         )
 
         @logger.info("AGENT: Tool '#{tool_call['name']}' completed")
@@ -586,6 +1099,15 @@ class TradingAgent
     ]
 
     hallucination_patterns.any? { |pattern| content.match?(pattern) }
+  end
+
+  # Class method to calculate the last trading day (most recent weekday, excluding weekends)
+  def self.last_trading_day(date = Date.today)
+    last_day = date
+    while last_day.saturday? || last_day.sunday?
+      last_day -= 1
+    end
+    last_day
   end
 end
 

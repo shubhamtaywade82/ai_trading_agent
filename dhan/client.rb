@@ -1,5 +1,6 @@
 require "dhan_hq"
 require_relative "../lib/logger"
+require "date"
 
 class DhanClient
   def initialize
@@ -197,9 +198,47 @@ class DhanClient
           data_array = result["ohlcv"] || result[:ohlcv]
           @logger.debug("DHAN: Found ohlcv array in hash, size: #{data_array.is_a?(Array) ? data_array.length : 'N/A'}")
           result = data_array.is_a?(Array) ? data_array : []
+        elsif result["open"] && result["high"] && result["low"] && result["close"]
+          # Hash with arrays of OHLCV values - convert to array of objects
+          @logger.debug("DHAN: Found hash with OHLCV arrays - converting to array of objects")
+          opens = result["open"] || result[:open] || []
+          highs = result["high"] || result[:high] || []
+          lows = result["low"] || result[:low] || []
+          closes = result["close"] || result[:close] || []
+          volumes = result["volume"] || result[:volume] || []
+          timestamps = result["timestamp"] || result[:timestamp] || []
+
+          # Convert to array of objects
+          result = []
+          max_length = [opens.length, highs.length, lows.length, closes.length].max
+
+          max_length.times do |i|
+            timestamp = timestamps[i]
+            # Convert Unix timestamp to datetime string if needed
+            datetime_str = if timestamp
+              begin
+                Time.at(timestamp.to_i).strftime('%Y-%m-%d %H:%M:%S')
+              rescue
+                nil
+              end
+            end
+
+            result << {
+              timestamp: timestamp,
+              datetime: datetime_str,
+              open: opens[i],
+              high: highs[i],
+              low: lows[i],
+              close: closes[i],
+              volume: volumes[i]
+            }
+          end
+
+          @logger.info("DHAN: Converted hash with arrays to array of #{result.length} intraday OHLCV objects")
         else
           # Hash might contain error or other structure
-          @logger.warn("DHAN: Intraday API returned hash but no 'data' or 'ohlcv' key found. Keys: #{result.keys.inspect}")
+          @logger.warn("DHAN: Intraday API returned hash but no recognized structure. Keys: #{result.keys.inspect}")
+          @logger.warn("DHAN: Full hash content: #{result.inspect}")
           return []
         end
       end
@@ -253,24 +292,82 @@ class DhanClient
           underlying_seg: exchange_segment
         )
 
-        # Use nearest expiry if available
+
+        pp "expiries---------------------------------------------------------------------------------------------------------"
+        pp expiries
+        pp expiries.is_a?(Array)
+        pp expiries.any?
+        pp expiries.inspect
+        pp expiries.length
+        pp expiries.first
+        pp expiries.last
+        pp expiries.first.inspect
+        pp expiries.last.inspect
+        # Find the latest next expiry date (earliest future date)
         if expiries.is_a?(Array) && expiries.any?
-          expiry_value = expiries.first
-          # Handle both hash and string formats
-          expiry = if expiry_value.is_a?(Hash)
-            expiry_value["expiry"] || expiry_value[:expiry] || expiry_value["expiry_date"] || expiry_value[:expiry_date]
-          else
-            expiry_value.to_s
+          @logger.debug("DHAN: Fetched expiry list: #{expiries.inspect}")
+
+          # Extract all expiry dates and parse them
+          expiry_dates = []
+          expiries.each do |expiry_item|
+            expiry_str = if expiry_item.is_a?(Hash)
+              expiry_item["expiry"] || expiry_item[:expiry] || expiry_item["expiry_date"] || expiry_item[:expiry_date]
+            else
+              expiry_item.to_s
+            end
+
+            if expiry_str
+              begin
+                # Try to parse the date - handle multiple formats
+                parsed_date = if expiry_str.match?(/^\d{4}-\d{2}-\d{2}$/)
+                  # YYYY-MM-DD format
+                  Date.parse(expiry_str)
+                elsif expiry_str.match?(/^\d{2}-\d{2}-\d{4}$/)
+                  # DD-MM-YYYY format
+                  Date.strptime(expiry_str, '%d-%m-%Y')
+                elsif expiry_str.match?(/^\d{2}\/\d{2}\/\d{4}$/)
+                  # DD/MM/YYYY format
+                  Date.strptime(expiry_str, '%d/%m/%Y')
+                else
+                  # Try generic parse
+                  Date.parse(expiry_str)
+                end
+                expiry_dates << { date: parsed_date, string: expiry_str }
+              rescue => e
+                @logger.warn("DHAN: Could not parse expiry date '#{expiry_str}': #{e.message}")
+              end
+            end
           end
 
-          if expiry
-            result = DhanHQ::Models::OptionChain.fetch(
-              underlying_scrip: security_id.to_i,
-              underlying_seg: exchange_segment,
-              expiry: expiry
-            )
+          if expiry_dates.any?
+            today = Date.today
+            # Filter to only future dates (>= today)
+            future_expiries = expiry_dates.select { |ed| ed[:date] >= today }
+
+            if future_expiries.any?
+              # Find the earliest future date (latest next expiry)
+              next_expiry = future_expiries.min_by { |ed| ed[:date] }
+              expiry = next_expiry[:string]
+              @logger.info("DHAN: Found #{future_expiries.length} future expiry(ies). Using next expiry: #{expiry} (#{next_expiry[:date]})")
+            else
+              # If no future dates, use the latest expiry (closest to today)
+              next_expiry = expiry_dates.max_by { |ed| ed[:date] }
+              expiry = next_expiry[:string]
+              @logger.warn("DHAN: No future expiries found. Using latest expiry: #{expiry} (#{next_expiry[:date]})")
+            end
+
+            if expiry
+              result = DhanHQ::Models::OptionChain.fetch(
+                underlying_scrip: security_id.to_i,
+                underlying_seg: exchange_segment,
+                expiry: expiry
+              )
+            else
+              @logger.warn("DHAN: Could not determine expiry from expiry list")
+              return { atm: nil, ce: [], pe: [], expiry_dates: [], strikes: [] }
+            end
           else
-            @logger.warn("DHAN: Could not extract expiry from: #{expiries.first.inspect}")
+            @logger.warn("DHAN: Could not parse any expiry dates from: #{expiries.inspect}")
             return { atm: nil, ce: [], pe: [], expiry_dates: [], strikes: [] }
           end
         else
