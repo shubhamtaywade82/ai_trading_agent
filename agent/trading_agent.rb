@@ -105,6 +105,20 @@ class TradingAgent
     today_str = Date.today.strftime('%Y-%m-%d')
     thirty_days_ago_str = (Date.today - 30).strftime('%Y-%m-%d')
 
+    # Calculate last trading day (most recent weekday, excluding weekends)
+    last_trading_day_obj = Date.today
+    while last_trading_day_obj.saturday? || last_trading_day_obj.sunday?
+      last_trading_day_obj -= 1
+    end
+    last_trading_day_str = last_trading_day_obj.strftime('%Y-%m-%d')
+
+    # Calculate last trading day - 1 (for intraday from_date)
+    last_trading_day_minus_one_obj = last_trading_day_obj - 1
+    while last_trading_day_minus_one_obj.saturday? || last_trading_day_minus_one_obj.sunday?
+      last_trading_day_minus_one_obj -= 1
+    end
+    last_trading_day_minus_one_str = last_trading_day_minus_one_obj.strftime('%Y-%m-%d')
+
     system_prompt = <<~PROMPT
       You are a trading analysis agent. You MUST use the available tools to get real market data.
 
@@ -115,7 +129,10 @@ class TradingAgent
       FORBIDDEN - DO NOT DO THESE:
       ❌ NEVER describe or explain what tools to call - YOU MUST ACTUALLY CALL THEM
       ❌ NEVER write "Step 1: Call find_instrument..." - INSTEAD, ACTUALLY CALL find_instrument
-      ❌ NEVER use placeholders like [Current Price], [Today's Date], [Strike Price], [RSI Value], [MA Values]
+      ❌ NEVER write code examples (Python, Ruby, JSON) showing how to call tools - ACTUALLY CALL THEM
+      ❌ NEVER write "I will call..." or "Now I will call..." - ACTUALLY CALL THE TOOL
+      ❌ NEVER write "Please wait for the result" - ACTUALLY CALL THE TOOL and the system will wait automatically
+      ❌ NEVER use placeholders like [Current Price], [Today's Date], <security_id>, <from find_instrument result>
       ❌ NEVER make up or estimate market data (prices, volumes, indicators, ratios)
       ❌ NEVER use generic statements like "approximately" or "around" without real data
       ❌ NEVER provide analysis without calling tools first
@@ -125,12 +142,14 @@ class TradingAgent
       ❌ NEVER use future dates - today is #{today_str}, so dates like 2026-01-12 are FORBIDDEN
 
       REQUIRED - YOU MUST DO THESE:
-      ✅ ALWAYS ACTUALLY CALL tools (don't describe calling them) in this exact order: find_instrument → get_daily_ohlcv → get_intraday_ohlcv → get_option_chain → get_ltp
+      ✅ ALWAYS ACTUALLY CALL tools using the tool calling function - DO NOT describe them, DO NOT write code examples
+      ✅ ALWAYS use the tool_calls format - when you want to call a tool, use the tool calling mechanism, not text description
       ✅ ALWAYS use real data from tool responses - quote exact numbers from tool results
+      ✅ ALWAYS extract actual values from previous tool results (e.g., if find_instrument returns security_id="13", use "13" directly)
       ✅ ALWAYS state "Data not available" if a tool returns empty/null results
       ✅ ALWAYS use dates that are #{today_str} or earlier - NEVER use future dates
-      ✅ For get_daily_ohlcv: use from_date="#{thirty_days_ago_str}" and to_date="#{today_str}"
-      ✅ For get_intraday_ohlcv: use from_date="#{today_str}" and to_date="#{today_str}"
+      ✅ For get_daily_ohlcv: use from_date="#{thirty_days_ago_str}" and to_date="#{today_str}" (from_date MUST be < to_date, from_date MUST be < last trading day)
+      ✅ For get_intraday_ohlcv: use from_date="#{last_trading_day_minus_one_str}" and to_date="#{today_str}" (from_date MUST be < to_date, from_date MUST be < last trading day)
       ✅ ALWAYS wait for tool responses before making any analysis
       ✅ ALWAYS cite the source: "According to the data from [tool_name]..."
 
@@ -142,31 +161,53 @@ class TradingAgent
       - If user asks: "find instrument", "get instrument", "instrument details", "show instrument", "what is [symbol] instrument"
       - ONLY call find_instrument tool
       - Return the instrument details and STOP immediately
-      - DO NOT call any other tools (get_daily_ohlcv, get_intraday_ohlcv, get_option_chain, get_ltp)
+      - DO NOT call any other tools
+
+      OHLCV QUERIES (find_instrument + OHLCV data):
+      - If user asks: "ohlcv", "daily ohlcv", "intraday ohlcv", "get ohlcv", "show ohlcv", "ohlcv data", "price data", "historical data"
+      - ⚠️ CRITICAL: You MUST call tools ONE AT A TIME using the tool calling function - DO NOT describe them, DO NOT write code
+      - Step 1: ACTUALLY CALL find_instrument(symbol="NIFTY", segment="IDX_I") using tool_calls - WAIT for result
+      - Step 2: Read the security_id from Step 1 result (it will be in the conversation), then:
+        * If user asks for "daily" or "daily ohlcv" → ACTUALLY CALL get_daily_ohlcv using tool_calls with the actual security_id value (e.g., "13") from Step 1, from_date="#{thirty_days_ago_str}", to_date="#{today_str}" (from_date MUST be < to_date, from_date MUST be < last trading day)
+        * If user asks for "intraday" or "1 minute" or "5 minute" or "15 minute" → ACTUALLY CALL get_intraday_ohlcv using tool_calls with appropriate interval:
+          - "1 minute" or "1min" → interval="1"
+          - "5 minute" or "5min" → interval="5"
+          - "15 minute" or "15min" → interval="15"
+          - from_date MUST be < to_date, from_date MUST be < last trading day (e.g., from_date="#{last_trading_day_minus_one_str}", to_date="#{today_str}")
+      - Step 3: If user asks for multiple intervals, call get_intraday_ohlcv ONCE per interval using tool_calls, WAITING for each result before calling the next
+      - Return the OHLCV data and STOP (do NOT call get_option_chain or get_ltp)
+      - ⚠️ NEVER use placeholders like <security_id> or <from find_instrument result> - you MUST use the actual value (e.g., "13") from the previous tool result
+      - ⚠️ NEVER call multiple tools at once - call ONE tool using tool_calls, wait for result, then call the next
+      - ⚠️ NEVER describe tools or write code examples - ACTUALLY CALL THEM using tool_calls
 
       ANALYSIS QUERIES (complete all 5 steps):
       - If user asks: "can I buy", "should I buy", "analysis", "recommendation", "trading advice", "buy recommendation"
       - THEN follow the FULL 5-step workflow:
         Step 1: ACTUALLY CALL find_instrument(symbol="NIFTY", segment="IDX_I") - Use tool calling function, don't describe it
-        Step 2: Use security_id from Step 1 → ACTUALLY CALL get_daily_ohlcv(security_id, exchange_segment, from_date="#{thirty_days_ago_str}", to_date="#{today_str}")
-        Step 3: Use security_id from Step 1 → ACTUALLY CALL get_intraday_ohlcv(security_id, exchange_segment, from_date="#{today_str}", to_date="#{today_str}", interval="5")
+        Step 2: Use security_id from Step 1 → ACTUALLY CALL get_daily_ohlcv(security_id, exchange_segment, from_date="#{thirty_days_ago_str}", to_date="#{today_str}") - from_date MUST be < to_date, from_date MUST be < last trading day
+        Step 3: Use security_id from Step 1 → ACTUALLY CALL get_intraday_ohlcv(security_id, exchange_segment, from_date="#{last_trading_day_minus_one_str}", to_date="#{today_str}", interval="5") - from_date MUST be < to_date, from_date MUST be < last trading day
         Step 4: Use security_id from Step 1 → ACTUALLY CALL get_option_chain(security_id, exchange_segment)
         Step 5: Use security_id from Step 1 → ACTUALLY CALL get_ltp(security_id, exchange_segment)
         Step 6: ONLY AFTER completing ALL 5 steps → Provide analysis with exact numbers from tool results
 
       CRITICAL RULES:
-      - If user only asks to find/get instrument details → ONLY call find_instrument, then STOP and return result
+      - If user only asks to find/get instrument details → ONLY call find_instrument, then STOP
+      - If user asks for OHLCV data → Call find_instrument, then get_daily_ohlcv and/or get_intraday_ohlcv (with requested intervals), then STOP
       - If user asks for analysis/recommendation → THEN complete ALL 5 tool calls (O1→O5) before providing final analysis
       - If a tool returns empty data, note it and CONTINUE to the next tool (only if doing full analysis)
       - DO NOT describe the workflow - ACTUALLY EXECUTE IT by calling tools
-      - DO NOT call unnecessary tools if user only wants instrument information
+      - DO NOT call unnecessary tools if user only wants specific data
 
       DATE CONSTRAINTS:
       - Today's date: #{today_str}
+      - Last trading day (excluding weekends): #{last_trading_day_str}
       - 30 days ago: #{thirty_days_ago_str}
       - NEVER use dates after #{today_str}
-      - For daily OHLCV: from_date should be #{thirty_days_ago_str}, to_date should be #{today_str}
-      - For intraday OHLCV: both from_date and to_date should be #{today_str}
+      - to_date can be today (#{today_str}) or earlier
+      - from_date MUST be < to_date (cannot be equal)
+      - from_date MUST be < last trading day (excluding weekends) - cannot be on or after last trading day
+      - For daily OHLCV: from_date should be #{thirty_days_ago_str}, to_date should be #{today_str} (from_date < to_date, from_date < last trading day)
+      - For intraday OHLCV: from_date should be #{last_trading_day_minus_one_str}, to_date should be #{today_str} (from_date < to_date, from_date < last trading day)
 
       DATA AVAILABILITY:
       - If a tool returns empty data or error, state: "Data not available from [tool_name]"
@@ -238,8 +279,9 @@ class TradingAgent
         # Check if user query is simple (just finding instrument) - CHECK THIS FIRST
         user_query_lower = @user_query.downcase
         is_simple_query = user_query_lower.match?(/find.*instrument|get.*instrument|instrument.*details|show.*instrument|what.*instrument|fing.*instrument/i)
+        is_ohlcv_query = user_query_lower.match?(/ohlcv|daily.*ohlcv|intraday.*ohlcv|get.*ohlcv|show.*ohlcv|ohlcv.*data|price.*data|historical.*data|1.*minute|5.*minute|15.*minute|1min|5min|15min/i)
 
-        @logger.debug("AGENT: Simple query check - query: '#{@user_query}', is_simple_query: #{is_simple_query}, tools_called_count: #{tools_called_count}")
+        @logger.debug("AGENT: Query type check - query: '#{@user_query}', is_simple_query: #{is_simple_query}, is_ohlcv_query: #{is_ohlcv_query}, tools_called_count: #{tools_called_count}")
 
         # If it's a simple query and we've found the instrument, allow early termination
         if is_simple_query && tools_called_count >= 1
@@ -253,33 +295,78 @@ class TradingAgent
           end
         end
 
-        # Check if LLM is describing actions instead of calling tools (only for analysis queries)
-        if describes_tool_usage?(response[:content]) && tools_called_count < 5 && !is_simple_query
-          @logger.warn("AGENT: WARNING - LLM is describing tool usage instead of calling tools!")
-          @logger.warn("AGENT: Tools called so far: #{tools_called_count}/5 - forcing next tool call")
+        # If it's an OHLCV query, check if we've completed the required steps
+        if is_ohlcv_query && tools_called_count >= 1
+          find_instrument_called = conversation.any? { |msg| msg[:role] == "tool" && msg[:name] == "find_instrument" }
+          daily_ohlcv_called = conversation.any? { |msg| msg[:role] == "tool" && msg[:name] == "get_daily_ohlcv" }
+          intraday_ohlcv_called = conversation.any? { |msg| msg[:role] == "tool" && msg[:name] == "get_intraday_ohlcv" }
 
-          # Determine which tool should be called next based on tools_called_count
+          # Check if user wants daily data
+          wants_daily = user_query_lower.match?(/daily/i)
+          # Check if user wants intraday data (and which intervals)
+          wants_intraday = user_query_lower.match?(/intraday|1.*minute|5.*minute|15.*minute|1min|5min|15min/i)
+
+          # If user asked for daily and we've called it, or if user asked for intraday and we've called it, allow termination
+          if find_instrument_called && ((wants_daily && daily_ohlcv_called) || (wants_intraday && intraday_ohlcv_called) || (!wants_daily && !wants_intraday && (daily_ohlcv_called || intraday_ohlcv_called)))
+            @logger.info("AGENT: OHLCV query detected - user asked for OHLCV data. Allowing early termination after OHLCV tools.")
+            return response[:content]
+          end
+        end
+
+        # Check if LLM is describing actions instead of calling tools
+        if describes_tool_usage?(response[:content]) && !is_simple_query
+          @logger.warn("AGENT: WARNING - LLM is describing tool usage instead of calling tools!")
+          @logger.warn("AGENT: Response contains descriptions/placeholders instead of actual tool calls")
+
+          # Extract security_id and exchange_segment from previous tool result if available
+          security_id = "13"  # Default
+          exchange_segment = "IDX_I"  # Default
+          find_result = conversation.find { |msg| msg[:role] == "tool" && msg[:name] == "find_instrument" }
+          if find_result && find_result[:content]
+            begin
+              find_data = JSON.parse(find_result[:content])
+              security_id = find_data["security_id"] || find_data[:security_id] || "13"
+              exchange_segment = find_data["exchange_segment"] || find_data[:exchange_segment] || "IDX_I"
+            rescue
+              # Keep defaults
+            end
+          end
+
           today = Date.today
           thirty_days_ago = today - 30
 
-          next_tool_instructions = {
-            1 => "Call get_daily_ohlcv with security_id=13, exchange_segment='IDX_I', from_date='#{thirty_days_ago.strftime('%Y-%m-%d')}', to_date='#{today.strftime('%Y-%m-%d')}'",
-            2 => "Call get_intraday_ohlcv with security_id=13, exchange_segment='IDX_I', from_date='#{today.strftime('%Y-%m-%d')}', to_date='#{today.strftime('%Y-%m-%d')}', interval='5'",
-            3 => "Call get_option_chain with security_id=13, exchange_segment='IDX_I'",
-            4 => "Call get_ltp with security_id=13, exchange_segment='IDX_I'"
-          }
+          # Determine which tool should be called next
+          if tools_called_count == 0
+            instruction = "You MUST call find_instrument(symbol='NIFTY', segment='IDX_I') using the tool calling function. Do NOT describe it, do NOT write code, do NOT use placeholders - ACTUALLY CALL IT."
+          elsif tools_called_count == 1 && is_ohlcv_query
+            wants_daily = @user_query.downcase.match?(/daily/i)
+            if wants_daily
+              instruction = "You MUST call get_daily_ohlcv(security_id='#{security_id}', exchange_segment='#{exchange_segment}', from_date='#{thirty_days_ago.strftime('%Y-%m-%d')}', to_date='#{today.strftime('%Y-%m-%d')}') using the tool calling function. Use the actual security_id='#{security_id}' and exchange_segment='#{exchange_segment}' from the previous result, not a placeholder."
+            else
+              instruction = "You MUST call get_intraday_ohlcv(security_id='#{security_id}', exchange_segment='#{exchange_segment}', from_date='#{today.strftime('%Y-%m-%d')}', to_date='#{today.strftime('%Y-%m-%d')}', interval='1') using the tool calling function. Use the actual security_id='#{security_id}' and exchange_segment='#{exchange_segment}' from the previous result."
+            end
+          else
+            instruction = "You described calling a tool but did not actually call it. You MUST use the tool calling function (tool_calls), not describe it in text, not write code examples, not use placeholders. ACTUALLY CALL THE TOOL with real values from previous tool results."
+          end
 
-          instruction = next_tool_instructions[tools_called_count] || "Complete the workflow by calling the remaining tools"
+          # Provide explicit example of tool calling format
+          tool_call_example = if tools_called_count == 0
+            "Use tool_calls like: {\"function\": {\"name\": \"find_instrument\", \"arguments\": {\"symbol\": \"NIFTY\", \"segment\": \"IDX_I\"}}}"
+          elsif tools_called_count == 1 && is_ohlcv_query && @user_query.downcase.match?(/daily/i)
+            "Use tool_calls like: {\"function\": {\"name\": \"get_daily_ohlcv\", \"arguments\": {\"security_id\": \"#{security_id}\", \"exchange_segment\": \"#{exchange_segment}\", \"from_date\": \"#{thirty_days_ago.strftime('%Y-%m-%d')}\", \"to_date\": \"#{today.strftime('%Y-%m-%d')}\"}}}"
+          else
+            "Use the tool_calls format with actual values from previous tool results."
+          end
 
           conversation << {
             role: "user",
-            content: "You described calling a tool but did not actually call it. You MUST use the tool calling function, not describe it. #{instruction}. Use the tool calling format, not text description."
+            content: "STOP. #{instruction} You are FORBIDDEN from describing tools, writing code examples, or using placeholders. You MUST use the tool calling function (tool_calls) with actual values. Example format: #{tool_call_example}. If you see security_id='#{security_id}' and exchange_segment='#{exchange_segment}' in a previous tool result, use '#{security_id}' and '#{exchange_segment}' directly in your tool call, not '<security_id>' or '<from find_instrument result>'."
           }
           next  # Retry the loop
         end
 
         # STRICT CHECK: Must complete all 5 steps before final response (only for analysis queries)
-        if tools_called_count < 5 && !is_simple_query
+        if tools_called_count < 5 && !is_simple_query && !is_ohlcv_query
           @logger.warn("AGENT: WARNING - Only #{tools_called_count}/5 tools called. Forcing continuation.")
 
           # Get the last tool result to extract security_id
@@ -347,6 +434,34 @@ class TradingAgent
         return response[:content]
       end
 
+      # If LLM tries to call multiple tools at once, reject and instruct to call one at a time
+      # This enforces sequential execution and prevents placeholders
+      if response[:tool_calls].length > 1
+        @logger.warn("AGENT: WARNING - LLM tried to call #{response[:tool_calls].length} tools at once!")
+        @logger.warn("AGENT: This is not allowed - tools must be called sequentially. Tool calls attempted: #{response[:tool_calls].map { |tc| tc['name'] || tc[:name] }.join(', ')}")
+
+        # Check if any tool call uses placeholders
+        has_placeholders = response[:tool_calls].any? do |tc|
+          args = tc["arguments"] || tc[:arguments] || {}
+          args_str = args.to_json
+          args_str.match?(/<security_id>|<from_step1>|placeholder/i)
+        end
+
+        if has_placeholders
+          @logger.warn("AGENT: WARNING - LLM used placeholders in tool arguments!")
+          conversation << {
+            role: "user",
+            content: "STOP. You tried to call multiple tools at once and used placeholders like <security_id>. This is FORBIDDEN. You MUST call tools ONE AT A TIME. First, call find_instrument(symbol='NIFTY', segment='IDX_I') and WAIT for the result. Then use the actual security_id value from that result (e.g., '13') to call the next tool. Never use placeholders - always use real values from previous tool results."
+          }
+        else
+          conversation << {
+            role: "user",
+            content: "STOP. You tried to call #{response[:tool_calls].length} tools at once. This is FORBIDDEN. You MUST call tools ONE AT A TIME. Call the first tool (find_instrument), WAIT for the result, then use that result to call the next tool. Never call multiple tools simultaneously."
+          }
+        end
+        next  # Retry the loop
+      end
+
       # Track that tools are being called
       tools_called_count += response[:tool_calls].length
 
@@ -367,6 +482,19 @@ class TradingAgent
           conversation << {
             role: "user",
             content: "The tool call you made was invalid (empty tool name). Please call find_instrument(symbol='NIFTY', segment='IDX_I') with the correct format."
+          }
+          next
+        end
+
+        # Validate tool call doesn't use placeholders
+        tool_args_str = (tool_args || {}).to_json
+        if tool_args_str.match?(/<security_id>|<from_step1>|placeholder/i)
+          @logger.error("AGENT: ERROR - Tool call uses placeholders! Tool: #{tool_name}, Args: #{tool_args_str}")
+          @logger.error("AGENT: You must use actual values from previous tool results, not placeholders")
+
+          conversation << {
+            role: "user",
+            content: "STOP. You used a placeholder like <security_id> in your tool call. This is FORBIDDEN. You MUST use the actual security_id value from the previous find_instrument result. Look at the tool results in the conversation and use the real security_id value (e.g., '13' for NIFTY), not a placeholder."
           }
           next
         end
@@ -410,13 +538,27 @@ class TradingAgent
       /will call/i,
       /going to call/i,
       /wait.*call/i,
+      /i will call/i,
+      /now i will/i,
       /result from find_instrument/i,
       /use security_id from step/i,
-      /according to the data.*step/i
+      /according to the data.*step/i,
+      /extract.*from.*result/i,
+      /please wait/i,
+      /wait for.*result/i,
+      /assuming.*result/i,
+      /import\s+\w+/i,  # Python imports like "import tool_calling_function"
+      /tcf\./i,  # tool_calling_function references
+      /define.*parameter/i,
+      /here.*function call/i,
+      /here.*sequence/i,
+      /here.*json/i,
+      /note that.*not filled/i,
+      /```(json|ruby|python|javascript)/i  # Code blocks
     ]
 
     # Also check for markdown code blocks or formatted text that looks like descriptions
-    has_code_blocks = content.include?("```") || content.match?(/```json|```ruby|```python/i)
+    has_code_blocks = content.include?("```") || content.match?(/```json|```ruby|```python|```javascript/i)
     has_step_formatting = content.match?(/^Step \d+:/i) || content.match?(/Step \d+:/i)
 
     description_patterns.any? { |pattern| content.match?(pattern) } || has_code_blocks || has_step_formatting
